@@ -28,6 +28,9 @@ var (
 	cachedCrCmp    archsimd.Int8x64
 	cachedNlCmp    archsimd.Int8x64
 	cachedSepCmp   [cachedSepCmpCount]archsimd.Int8x64
+
+	// PCLMULQDQ cached value: all-ones for carryless multiplication
+	cachedAllOnes archsimd.Uint64x2
 )
 
 // SIMD processing constants.
@@ -50,6 +53,13 @@ func init() {
 		cachedQuoteCmp = cachedSepCmp['"']
 		cachedCrCmp = cachedSepCmp['\r']
 		cachedNlCmp = cachedSepCmp['\n']
+
+		// Pre-load all-ones value for carryless multiplication (PCLMULQDQ)
+		// Used in prefixXOR: mask × 0xFFFFFFFFFFFFFFFF computes prefix XOR
+		cachedAllOnes = archsimd.LoadUint64x2(&[2]uint64{
+			0xFFFFFFFFFFFFFFFF,
+			0xFFFFFFFFFFFFFFFF,
+		})
 	}
 }
 
@@ -61,6 +71,42 @@ func init() {
 // This centralizes the SIMD eligibility check used across multiple functions.
 func shouldUseSIMD(dataLen int) bool {
 	return useAVX512 && dataLen >= simdMinThreshold
+}
+
+// =============================================================================
+// Prefix XOR (Quote Region Mask Computation)
+// =============================================================================
+
+// prefixXOR computes the prefix XOR of the input mask.
+// For each bit position i, the result bit is the XOR of bits 0 through i.
+//
+// This is used to convert a quote position mask into an "inside quotes" mask:
+//
+//	input:  0b01001010 (quote positions at 1, 3, 6)
+//	output: 0b11000110 (inside quote regions)
+//
+// When AVX-512 is available, uses PCLMULQDQ instruction for ~3x speedup.
+// Mathematical basis (carryless multiplication in GF(2)):
+//
+//	mask × all_ones = mask × (1 + 2 + 4 + ... + 2^63)
+//	                = mask ^ (mask << 1) ^ (mask << 2) ^ ... ^ (mask << 63)
+//
+// The lower 64 bits of this product give us the prefix XOR.
+func prefixXOR(mask uint64) uint64 {
+	if useAVX512 {
+		// PCLMULQDQ path: ~3-4 instructions
+		maskVec := archsimd.LoadUint64x2(&[2]uint64{mask, 0})
+		result := maskVec.CarrylessMultiply(0, 0, cachedAllOnes)
+		return result.GetElem(0)
+	}
+	// Scalar path: 6 shifts + 6 XORs = 12 instructions
+	mask ^= mask << 1
+	mask ^= mask << 2
+	mask ^= mask << 4
+	mask ^= mask << 8
+	mask ^= mask << 16
+	mask ^= mask << 32
+	return mask
 }
 
 // =============================================================================
@@ -391,13 +437,8 @@ func processQuotesAndSeparators(quoteMask, sepMask, nextQuoteMask uint64, state 
 	state.quoted = quoted
 
 	// Invalidate separators using prefix XOR on cleaned quote mask
-	inQuote := quoteMaskOut
-	inQuote ^= inQuote << 1
-	inQuote ^= inQuote << 2
-	inQuote ^= inQuote << 4
-	inQuote ^= inQuote << 8
-	inQuote ^= inQuote << 16
-	inQuote ^= inQuote << 32
+	// Uses PCLMULQDQ when available for ~3x fewer instructions
+	inQuote := prefixXOR(quoteMaskOut)
 
 	if initialQuoted != 0 {
 		inQuote = ^inQuote
@@ -410,13 +451,8 @@ func processQuotesAndSeparators(quoteMask, sepMask, nextQuoteMask uint64, state 
 // invalidateNewlinesInQuotes removes newline bits that are inside quoted regions.
 func invalidateNewlinesInQuotes(quoteMask, newlineMask uint64, state *scanState) uint64 {
 	// Prefix XOR: inQuote[i] = 1 iff positions 0..i have odd number of quotes
-	inQuote := quoteMask
-	inQuote ^= inQuote << 1
-	inQuote ^= inQuote << 2
-	inQuote ^= inQuote << 4
-	inQuote ^= inQuote << 8
-	inQuote ^= inQuote << 16
-	inQuote ^= inQuote << 32
+	// Uses PCLMULQDQ when available for ~3x fewer instructions
+	inQuote := prefixXOR(quoteMask)
 
 	// If we started inside a quoted region, invert the mask
 	if state.quoted != 0 {
